@@ -5,8 +5,9 @@ mod spawning;
 use std::{
     convert::TryInto,
     env,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     io::{self, stdin, stdout, BufRead, BufReader, Read, Write},
+    path::PathBuf,
 };
 
 use serde::{Deserialize, Serialize};
@@ -46,11 +47,13 @@ fn main() {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct CommandSpec {
     command_line: String,
     console_width: u32,
     console_height: u32,
+    working_directory: PathBuf,
+    environment: Vec<(OsString, OsString)>,
 }
 
 fn client() -> io::Result<i32> {
@@ -75,6 +78,8 @@ fn client() -> io::Result<i32> {
         command_line,
         console_width,
         console_height,
+        working_directory: std::env::current_dir().unwrap(),
+        environment: std::env::vars_os().collect(),
     };
 
     let mut pipe = if let Some(pipe) = Pipe::connect(&pipe_name(1))? {
@@ -177,7 +182,12 @@ fn server_thread(pipe: Pipe) -> io::Result<()> {
 
     let mut attribute_list = ProcThreadAttributeList::new(1)?;
     attribute_list.set_pseudoconsole(pty.pcon())?;
-    let mut process = Process::spawn(&command.command_line, &attribute_list)?;
+    let mut process = Process::spawn(
+        &command.command_line,
+        &attribute_list,
+        &command.working_directory,
+        command.environment.iter().map(|(k, v)| (&**k, &**v)),
+    )?;
 
     process.wait()?;
 

@@ -1,4 +1,5 @@
-use std::{convert::TryInto, io, mem, ptr};
+use std::{convert::TryInto, ffi::OsStr, io, mem, path::Path, ptr};
+use std::{os::windows::prelude::*, path::PathBuf};
 
 use widestring::U16CString;
 use winapi::{
@@ -15,7 +16,8 @@ use winapi::{
         },
         synchapi::WaitForSingleObject,
         winbase::{
-            CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, INFINITE, STARTUPINFOEXW, WAIT_OBJECT_0,
+            CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+            STARTUPINFOEXW, WAIT_OBJECT_0,
         },
         wincontypes::HPCON,
         winnt::{
@@ -45,12 +47,23 @@ pub struct ProcThreadAttributeList {
 }
 
 impl Process {
-    pub fn spawn(
+    pub fn spawn<'a>(
         command_line: &str,
         attribute_list: &ProcThreadAttributeList,
+        working_directory: &Path,
+        environment: impl Iterator<Item = (&'a OsStr, &'a OsStr)>,
     ) -> io::Result<Process> {
         unsafe {
             let command_line = U16CString::from_str(command_line).unwrap();
+            let working_directory = U16CString::from_os_str(working_directory).unwrap();
+            let mut environment_block: Vec<u16> = Vec::new();
+            for (k, v) in environment {
+                environment_block.extend(k.encode_wide());
+                environment_block.push(b'=' as u16);
+                environment_block.extend(v.encode_wide());
+                environment_block.push(0);
+            }
+            environment_block.push(0);
 
             // Create a kill on close job object to ensure we don't leave zombie conhosts around
             let job_object = CreateJobObjectW(ptr::null_mut(), ptr::null());
@@ -80,9 +93,9 @@ impl Process {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 FALSE,
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
-                ptr::null_mut(),
-                ptr::null_mut(),
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                environment_block.as_ptr() as _,
+                working_directory.as_ptr(),
                 &mut startup_info as *mut STARTUPINFOEXW as _,
                 &mut process_info,
             ) != TRUE

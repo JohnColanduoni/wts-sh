@@ -4,7 +4,7 @@ use widestring::U16CString;
 use winapi::{
     shared::{
         basetsd::SIZE_T,
-        minwindef::{DWORD, FALSE, TRUE},
+        minwindef::{FALSE, TRUE},
     },
     um::{
         handleapi::CloseHandle,
@@ -33,7 +33,6 @@ impl Drop for Process {
 
 pub struct ProcThreadAttributeList {
     buffer: Vec<u8>,
-    capacity: u32,
 }
 
 impl Process {
@@ -92,11 +91,11 @@ impl ProcThreadAttributeList {
                 return Err(io::Error::last_os_error());
             }
 
-            Ok(ProcThreadAttributeList { buffer, capacity })
+            Ok(ProcThreadAttributeList { buffer })
         }
     }
 
-    pub fn set_pseudoconsole(&mut self, index: usize, pcon: HPCON) -> io::Result<()> {
+    pub fn set_pseudoconsole(&mut self, pcon: HPCON) -> io::Result<()> {
         unsafe {
             if UpdateProcThreadAttribute(
                 self.buffer.as_mut_ptr() as _,

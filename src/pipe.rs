@@ -1,18 +1,14 @@
 use std::{
     convert::TryInto,
-    env,
-    ffi::OsStr,
-    io::{self, stdin, stdout, BufRead, BufReader, Read, Write},
+    io::{self, Read, Write},
     mem, ptr,
     sync::Arc,
-    time::Duration,
 };
 
-use serde::{Deserialize, Serialize};
 use widestring::U16CString;
 use winapi::{
     shared::{
-        minwindef::{BOOL, DWORD, FALSE, TRUE},
+        minwindef::{DWORD, FALSE, TRUE},
         winerror::{ERROR_BROKEN_PIPE, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_SUCCESS},
     },
     um::{
@@ -21,42 +17,27 @@ use winapi::{
             TRUSTEE_W,
         },
         aclapi::SetEntriesInAclW,
-        consoleapi::{ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, SetConsoleMode},
         fileapi::{CreateFileW, FlushFileBuffers, ReadFile, WriteFile, OPEN_EXISTING},
         ioapiset::GetOverlappedResultEx,
-        minwinbase::{LPOVERLAPPED, OVERLAPPED, SECURITY_ATTRIBUTES},
-        namedpipeapi::{ConnectNamedPipe, CreateNamedPipeW, CreatePipe, SetNamedPipeHandleState},
-        processenv::GetStdHandle,
-        processthreadsapi::{
-            GetCurrentProcess, GetCurrentProcessId, InitializeProcThreadAttributeList,
-            OpenProcessToken, ProcessIdToSessionId,
-        },
+        minwinbase::{OVERLAPPED, SECURITY_ATTRIBUTES},
+        namedpipeapi::{ConnectNamedPipe, CreateNamedPipeW, SetNamedPipeHandleState},
+        processthreadsapi::{GetCurrentProcess, OpenProcessToken},
         securitybaseapi::{
             GetTokenInformation, InitializeSecurityDescriptor, SetSecurityDescriptorDacl,
         },
-        synchapi::{CreateEventW, WaitForSingleObject},
+        synchapi::CreateEventW,
         winbase::{
-            LocalFree, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
-            FILE_FLAG_WRITE_THROUGH, INFINITE, PIPE_ACCESS_DUPLEX, PIPE_READMODE_BYTE,
-            PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_TYPE_MESSAGE,
-            PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-            WAIT_OBJECT_0,
+            LocalFree, FILE_FLAG_OVERLAPPED, INFINITE, PIPE_ACCESS_DUPLEX, PIPE_READMODE_BYTE,
+            PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
         },
-        wincon::{
-            GetConsoleScreenBufferInfo, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT,
-            ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
-            ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-        },
-        wincontypes::{COORD, HPCON},
         winnt::{
-            TokenUser, GENERIC_READ, GENERIC_WRITE, HANDLE, KEY_ALL_ACCESS,
-            SECURITY_DESCRIPTOR_MIN_LENGTH, SECURITY_DESCRIPTOR_REVISION, TOKEN_INFORMATION_CLASS,
-            TOKEN_READ, TOKEN_USER,
+            TokenUser, GENERIC_READ, GENERIC_WRITE, KEY_ALL_ACCESS, SECURITY_DESCRIPTOR_MIN_LENGTH,
+            SECURITY_DESCRIPTOR_REVISION, TOKEN_INFORMATION_CLASS, TOKEN_READ, TOKEN_USER,
         },
     },
 };
 use winhandle::{
-    macros::{GetLastError, INVALID_HANDLE_VALUE, SUCCEEDED},
+    macros::{GetLastError, INVALID_HANDLE_VALUE},
     WinHandle, WinHandleRef, WinHandleTarget,
 };
 

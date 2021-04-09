@@ -7,61 +7,15 @@ use std::{
     env,
     ffi::OsStr,
     io::{self, stdin, stdout, BufRead, BufReader, Read, Write},
-    mem, ptr,
-    sync::Arc,
-    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
-use widestring::U16CString;
 use winapi::{
-    shared::{
-        minwindef::{BOOL, DWORD, FALSE, TRUE},
-        winerror::{ERROR_BROKEN_PIPE, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_SUCCESS},
-    },
+    shared::minwindef::{DWORD, TRUE},
     um::{
-        accctrl::{
-            EXPLICIT_ACCESSW, NO_INHERITANCE, SET_ACCESS, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
-            TRUSTEE_W,
-        },
-        aclapi::SetEntriesInAclW,
-        consoleapi::{ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, SetConsoleMode},
-        fileapi::{CreateFileW, FlushFileBuffers, ReadFile, WriteFile, OPEN_EXISTING},
-        ioapiset::GetOverlappedResultEx,
-        minwinbase::{LPOVERLAPPED, OVERLAPPED, SECURITY_ATTRIBUTES},
-        namedpipeapi::{ConnectNamedPipe, CreateNamedPipeW, CreatePipe, SetNamedPipeHandleState},
-        processenv::GetStdHandle,
-        processthreadsapi::{
-            GetCurrentProcess, GetCurrentProcessId, InitializeProcThreadAttributeList,
-            OpenProcessToken, ProcessIdToSessionId,
-        },
-        securitybaseapi::{
-            GetTokenInformation, InitializeSecurityDescriptor, SetSecurityDescriptorDacl,
-        },
-        synchapi::{CreateEventW, WaitForSingleObject},
-        winbase::{
-            LocalFree, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
-            FILE_FLAG_WRITE_THROUGH, INFINITE, PIPE_ACCESS_DUPLEX, PIPE_READMODE_BYTE,
-            PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_TYPE_MESSAGE,
-            PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-            WAIT_OBJECT_0,
-        },
-        wincon::{
-            GetConsoleScreenBufferInfo, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT,
-            ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
-            ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-        },
-        wincontypes::{COORD, HPCON},
-        winnt::{
-            TokenUser, GENERIC_READ, GENERIC_WRITE, HANDLE, KEY_ALL_ACCESS,
-            SECURITY_DESCRIPTOR_MIN_LENGTH, SECURITY_DESCRIPTOR_REVISION, TOKEN_INFORMATION_CLASS,
-            TOKEN_READ, TOKEN_USER,
-        },
+        processthreadsapi::{GetCurrentProcessId, ProcessIdToSessionId},
+        wincontypes::COORD,
     },
-};
-use winhandle::{
-    macros::{GetLastError, INVALID_HANDLE_VALUE, SUCCEEDED},
-    WinHandle, WinHandleRef, WinHandleTarget,
 };
 
 use crate::console::{enable_virtual_console, get_console_size, Pty};
@@ -217,7 +171,7 @@ fn server_thread(pipe: Pipe) -> io::Result<()> {
     )?;
 
     let mut attribute_list = ProcThreadAttributeList::new(1)?;
-    attribute_list.set_pseudoconsole(0, pty.pcon())?;
+    attribute_list.set_pseudoconsole(pty.pcon())?;
     let mut process = Process::spawn(&command.command_line, &attribute_list)?;
 
     process.wait()?;

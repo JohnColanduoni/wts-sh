@@ -77,7 +77,12 @@ fn client() -> io::Result<i32> {
         console_height,
     };
 
-    let mut pipe = Pipe::connect(&pipe_name(1))?;
+    let mut pipe = if let Some(pipe) = Pipe::connect(&pipe_name(1))? {
+        pipe
+    } else {
+        eprintln!("a wts-sh server does not appear to be running");
+        return Ok(1);
+    };
 
     let mut command_json = serde_json::to_string(&command).unwrap();
     command_json.push('\n');
@@ -182,6 +187,7 @@ fn server_thread(pipe: Pipe) -> io::Result<()> {
 }
 
 fn pipe_name(session_id: DWORD) -> String {
+    // Ensure we use pipe in the global namespace, as we want access from different sessions to be possible
     format!(r#"\??\GLOBAL\pipe\Global\WtsSh.{}"#, session_id)
 }
 

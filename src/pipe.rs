@@ -9,7 +9,10 @@ use widestring::U16CString;
 use winapi::{
     shared::{
         minwindef::{DWORD, FALSE, TRUE},
-        winerror::{ERROR_BROKEN_PIPE, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_SUCCESS},
+        winerror::{
+            ERROR_BROKEN_PIPE, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_PIPE_BUSY,
+            ERROR_SUCCESS,
+        },
     },
     um::{
         accctrl::{
@@ -150,7 +153,7 @@ impl Pipe {
         Ok(Pipe { shared, event })
     }
 
-    pub fn connect(pipe_name: &str) -> io::Result<Pipe> {
+    pub fn connect(pipe_name: &str) -> io::Result<Option<Pipe>> {
         unsafe {
             let pipe_name = U16CString::from_str(pipe_name).unwrap();
             let handle = CreateFileW(
@@ -163,7 +166,11 @@ impl Pipe {
                 ptr::null_mut(),
             );
             if handle == INVALID_HANDLE_VALUE {
-                return Err(io::Error::last_os_error());
+                if GetLastError() == ERROR_PIPE_BUSY {
+                    return Ok(None);
+                } else {
+                    return Err(io::Error::last_os_error());
+                }
             }
             let pipe = WinHandle::from_raw_unchecked(handle);
 
@@ -176,10 +183,10 @@ impl Pipe {
 
             let event = create_event()?;
 
-            Ok(Pipe {
+            Ok(Some(Pipe {
                 shared: Arc::new(_Pipe { pipe }),
                 event,
-            })
+            }))
         }
     }
 

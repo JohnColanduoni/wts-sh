@@ -10,6 +10,6 @@ name = "wts-sh"
 clap = { version = "3.0.0-beta.2", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-winapi = { version = "0.3.9", features = ["std", "minwindef", "winnt", "namedpipeapi", "processthreadsapi", "securitybaseapi", "aclapi", "wincontypes", "wincon", "synchapi", "ioapiset"] }
+winapi = { version = "0.3.9", features = ["std", "minwindef", "winnt", "namedpipeapi", "processthreadsapi", "securitybaseapi", "aclapi", "wincontypes", "wincon", "synchapi", "ioapiset", "jobapi2"] }
 winhandle = "0.3.0"
 widestring = "0.4.3"

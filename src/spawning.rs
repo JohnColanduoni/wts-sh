@@ -1,25 +1,34 @@
-use std::{convert::TryInto, io, ptr};
+use std::{convert::TryInto, io, mem, ptr};
 
 use widestring::U16CString;
 use winapi::{
     shared::{
         basetsd::SIZE_T,
-        minwindef::{FALSE, TRUE},
+        minwindef::{DWORD, FALSE, TRUE},
     },
     um::{
         handleapi::CloseHandle,
+        jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject},
         processthreadsapi::{
-            CreateProcessW, InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
-            PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_LIST,
+            CreateProcessW, InitializeProcThreadAttributeList, ResumeThread,
+            UpdateProcThreadAttribute, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_LIST,
         },
         synchapi::WaitForSingleObject,
-        winbase::{EXTENDED_STARTUPINFO_PRESENT, INFINITE, STARTUPINFOEXW, WAIT_OBJECT_0},
+        winbase::{
+            CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, INFINITE, STARTUPINFOEXW, WAIT_OBJECT_0,
+        },
         wincontypes::HPCON,
+        winnt::{
+            JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        },
     },
 };
+use winhandle::WinHandle;
 
 pub struct Process {
     process_info: PROCESS_INFORMATION,
+    _job_object: WinHandle,
 }
 
 impl Drop for Process {
@@ -43,6 +52,24 @@ impl Process {
         unsafe {
             let command_line = U16CString::from_str(command_line).unwrap();
 
+            // Create a kill on close job object to ensure we don't leave zombie conhosts around
+            let job_object = CreateJobObjectW(ptr::null_mut(), ptr::null());
+            if job_object.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let job_object = WinHandle::from_raw_unchecked(job_object);
+            let mut job_info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
+            job_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job_object.get(),
+                JobObjectExtendedLimitInformation,
+                &job_info as *const _ as _,
+                mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as DWORD,
+            ) != TRUE
+            {
+                return Err(io::Error::last_os_error());
+            }
+
             let mut startup_info: STARTUPINFOEXW = std::mem::zeroed();
             startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as _;
             startup_info.lpAttributeList = attribute_list.ptr() as _;
@@ -53,7 +80,7 @@ impl Process {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 FALSE,
-                EXTENDED_STARTUPINFO_PRESENT,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
                 ptr::null_mut(),
                 ptr::null_mut(),
                 &mut startup_info as *mut STARTUPINFOEXW as _,
@@ -64,7 +91,20 @@ impl Process {
                 return Err(io::Error::last_os_error());
             }
 
-            Ok(Process { process_info })
+            // Add to job object
+            if AssignProcessToJobObject(job_object.get(), process_info.hProcess) != TRUE {
+                return Err(io::Error::last_os_error());
+            }
+
+            // Now resume process
+            if ResumeThread(process_info.hThread) == 0xFFFFFFFF {
+                return Err(io::Error::last_os_error());
+            }
+
+            Ok(Process {
+                process_info,
+                _job_object: job_object,
+            })
         }
     }
 

@@ -56,10 +56,7 @@ pub fn get_console_size() -> io::Result<(u32, u32)> {
         if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &mut info) != TRUE {
             return Err(io::Error::last_os_error());
         }
-        Ok((
-            (info.srWindow.Right - info.srWindow.Left + 1) as u32,
-            (info.srWindow.Bottom - info.srWindow.Top + 1) as u32,
-        ))
+        Ok((info.dwSize.X as u32, info.dwSize.Y as u32))
     }
 }
 

@@ -177,7 +177,7 @@ fn server_thread(pipe: Pipe) -> io::Result<()> {
         },
         pipe.handle(),
         pipe.handle(),
-        PSEUDOCONSOLE_INHERIT_CURSOR,
+        0,
     )?;
 
     let mut attribute_list = ProcThreadAttributeList::new(1)?;
@@ -210,5 +210,3 @@ fn get_current_session() -> io::Result<DWORD> {
         Ok(session_id)
     }
 }
-
-const PSEUDOCONSOLE_INHERIT_CURSOR: DWORD = 1;

@@ -100,8 +100,9 @@ impl Process {
                 &mut process_info,
             ) != TRUE
             {
-                eprintln!("spawn failed");
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                eprintln!("spawn failed: {:?}", err);
+                return Err(err);
             }
 
             // Add to job object

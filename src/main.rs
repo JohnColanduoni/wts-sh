@@ -5,16 +5,22 @@ mod pipe;
 mod spawning;
 
 use std::{
+    borrow::Cow,
     convert::TryInto,
     env,
     ffi::{OsStr, OsString},
+    fs,
     io::{self, stdin, stdout, BufRead, BufReader, Read, Write},
     mem::{self, MaybeUninit},
     path::PathBuf,
+    sync::Arc,
 };
 
+use clap::Parser;
 use console::{read_events, InputRecord};
-use serde::{Deserialize, Serialize};
+use serde::{de::VariantAccess, Deserialize, Serialize, __private::ser};
+use tracing::{debug, debug_span, info, info_span, trace, trace_span};
+use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 use winapi::{
     shared::minwindef::{DWORD, TRUE},
     um::{
@@ -23,14 +29,31 @@ use winapi::{
     },
 };
 
-use crate::console::{enable_virtual_console, get_console_size, Pty};
 use crate::pipe::{Pipe, ServerPipe};
 use crate::spawning::{ProcThreadAttributeList, Process};
+use crate::{
+    console::{enable_virtual_console, get_console_size, Pty},
+    pipe::AnonPipe,
+};
+
+#[derive(Parser, Debug)]
+struct Options {
+    #[clap(long)]
+    server: bool,
+
+    #[clap(long)]
+    log_file: Option<PathBuf>,
+}
 
 fn main() {
-    let args: Vec<_> = env::args_os().collect();
+    let (options, command) = parse_args();
 
-    if args.get(1).map(|x| &**x) == Some(OsStr::new("--server")) {
+    if options.server {
+        if !command.is_empty() {
+            eprintln!("unexpected command arguments for server");
+            std::process::exit(2);
+        }
+
         match server() {
             Ok(ret) => {
                 std::process::exit(ret);
@@ -41,7 +64,7 @@ fn main() {
         }
     }
 
-    match client() {
+    match client(&options, &command) {
         Ok(ret) => {
             std::process::exit(ret);
         }
@@ -49,6 +72,42 @@ fn main() {
             panic!("error encountered: {}", err);
         }
     }
+}
+
+fn parse_args() -> (Options, Vec<OsString>) {
+    let args: Vec<_> = env::args_os().collect();
+    let mut last_error: Option<clap::Error> = None;
+    // Try to parse as many arguments as flags as possible
+    // Note that we don't go past 1, since that is the current executable name and clap always expects it
+    for pivot in (1..=args.len()).rev() {
+        let flags = &args[..pivot];
+        let command = &args[pivot..];
+        match Options::try_parse_from(flags) {
+            Ok(options) => {
+                // Check if first command argument is okay
+                if command.first().map(|x| &**x) == Some(OsStr::new("--")) {
+                    // Explicit command separator, skip it and accept whatever follows as the command
+                    return (options, command[1..].to_vec());
+                } else if command
+                    .first()
+                    .and_then(|x| x.to_str())
+                    .map(|flag| flag.starts_with("--"))
+                    .unwrap_or(false)
+                {
+                    // First command starts with `--`. This likely indicates an invalid flag, print last error
+                    last_error.unwrap().exit();
+                } else {
+                    // First command argument doesn't look like a flag, we're good to go
+                    return (options, command.to_vec());
+                }
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+    // At the very least, a pivot of 0 should always work
+    unreachable!()
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -60,13 +119,32 @@ struct CommandSpec {
     environment: Vec<(OsString, OsString)>,
 }
 
-fn client() -> io::Result<i32> {
+#[derive(Serialize, Deserialize, Debug)]
+enum ShellEvent<'a> {
+    KeySequence { bytes: Cow<'a, [u8]> },
+    Resize { width: u32, height: u32 },
+}
+
+fn client(options: &Options, command: &[OsString]) -> io::Result<i32> {
+    let _appender_guard;
+    if let Some(log_filename) = &options.log_file {
+        let log_file = fs::File::create(log_filename).expect("failed to open log file");
+        let (non_blocking, _guard) = tracing_appender::non_blocking(log_file);
+        tracing_subscriber::fmt()
+            .with_writer(non_blocking)
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+            .with_ansi(false)
+            .init();
+        _appender_guard = _guard;
+    }
+
     let mut command_line = String::new();
     let mut first_arg = true;
-    for arg in env::args_os().skip(1) {
+    for arg in command {
         let arg_str = arg.to_str().expect("invalid unicode in argument");
 
-        // FIXME: won't handle argument correctly
+        // FIXME: won't handle escaped argument correctly
         if first_arg {
             first_arg = false;
         } else {
@@ -122,18 +200,36 @@ fn client() -> io::Result<i32> {
             let mut output_code_units: Vec<u16> = Vec::new();
             let mut output_bytes = Vec::new();
             loop {
-                for event in read_events(&mut buffer)? {
-                    match event {
-                        InputRecord::Key(key) => {
-                            let uchar = unsafe { *key.uChar.UnicodeChar() };
-                            if key.bKeyDown != 0 {
-                                output_code_units.push(uchar);
+                {
+                    let span = trace_span!("read_events");
+                    let _guard = span.enter();
+                    for event in read_events(&mut buffer)? {
+                        match event {
+                            InputRecord::Key(key) => {
+                                let uchar = unsafe { *key.uChar.UnicodeChar() };
+                                trace!(
+                                    uchar,
+                                    key_down = key.bKeyDown != 0,
+                                    key_code = key.wVirtualKeyCode,
+                                    "key event"
+                                );
+                                if key.bKeyDown != 0 {
+                                    output_code_units.push(uchar);
+                                }
                             }
+                            InputRecord::Mouse(_) => todo!(),
+                            InputRecord::WindowBufferSize(_) => {
+                                // The size provided here is a buffer size, not a screen size
+                                let (width, height) = get_console_size()?;
+
+                                debug!(width, height, "window resize event");
+                                let event = ShellEvent::Resize { width, height };
+                                // TODO: buffer
+                                bincode::serialize_into(&mut pipe, &event).unwrap();
+                            }
+                            InputRecord::Menu(_) => todo!(),
+                            InputRecord::Focus(_) => todo!(),
                         }
-                        InputRecord::Mouse(_) => todo!(),
-                        InputRecord::WindowBufferSize(_) => todo!(),
-                        InputRecord::Menu(_) => todo!(),
-                        InputRecord::Focus(_) => todo!(),
                     }
                 }
 
@@ -170,7 +266,11 @@ fn client() -> io::Result<i32> {
                 }
 
                 if !output_bytes.is_empty() {
-                    pipe.write_all(&output_bytes)?;
+                    let event = ShellEvent::KeySequence {
+                        bytes: Cow::Borrowed(&output_bytes),
+                    };
+                    // TODO: buffer
+                    bincode::serialize_into(&mut pipe, &event).unwrap();
                 }
             }
         }
@@ -183,6 +283,13 @@ fn client() -> io::Result<i32> {
 }
 
 fn server() -> io::Result<i32> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+        .init();
+
+    info!("starting up wts-sh server");
+
     let session_id = get_current_session()?;
 
     if session_id == 0 {
@@ -204,6 +311,9 @@ fn server() -> io::Result<i32> {
 }
 
 fn server_thread(pipe: Pipe) -> io::Result<()> {
+    let span = info_span!("run_command", command_line = tracing::field::Empty);
+    let _guard = span.enter();
+
     let mut reader = BufReader::new(pipe.copy()?);
 
     let mut command_json = String::new();
@@ -213,7 +323,12 @@ fn server_thread(pipe: Pipe) -> io::Result<()> {
     let command: CommandSpec =
         serde_json::from_str(&command_json).expect("failed to deserialize command");
 
-    let pty = Pty::new(
+    debug!(?command, "parsed command");
+    span.record("command_line", &&*command.command_line);
+
+    let (mut pty_input_tx, pty_input_rx) = AnonPipe::pair()?;
+
+    let pty = Arc::new(Pty::new(
         COORD {
             X: command
                 .console_width
@@ -224,10 +339,35 @@ fn server_thread(pipe: Pipe) -> io::Result<()> {
                 .try_into()
                 .expect("console height too large"),
         },
-        pipe.handle(),
+        pty_input_rx.handle(),
         pipe.handle(),
         0,
-    )?;
+    )?);
+
+    let _read_thread = std::thread::spawn({
+        let pipe = pipe.copy()?;
+        let pty = pty.clone();
+        move || -> io::Result<()> {
+            let span = debug_span!("server_thread::read_thread");
+            let _guard = span.enter();
+
+            let mut event_reader = BufReader::new(pipe);
+
+            loop {
+                let event: ShellEvent = bincode::deserialize_from(&mut event_reader).unwrap();
+
+                match event {
+                    ShellEvent::KeySequence { bytes } => {
+                        pty_input_tx.write_all(&bytes)?;
+                        pty_input_tx.flush()?;
+                    }
+                    ShellEvent::Resize { width, height } => {
+                        pty.resize(width, height)?;
+                    }
+                }
+            }
+        }
+    });
 
     let mut attribute_list = ProcThreadAttributeList::new(1)?;
     attribute_list.set_pseudoconsole(pty.pcon())?;
@@ -240,7 +380,7 @@ fn server_thread(pipe: Pipe) -> io::Result<()> {
 
     process.wait()?;
 
-    eprintln!("process exited");
+    info!("finished servicing client");
 
     Ok(())
 }

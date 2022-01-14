@@ -7,9 +7,13 @@ edition = "2018"
 name = "wts-sh"
 
 [dependencies]
-clap = { version = "3.0.0-beta.2", features = ["derive"] }
+bincode = "1.3"
+clap = { version = "3.0", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tracing = "0.1.29"
+tracing-appender = "0.2.0"
+tracing-subscriber = { version = "0.3.5", features = ["env-filter"] }
 winapi = { version = "0.3.9", features = ["std", "minwindef", "winnt", "namedpipeapi", "processthreadsapi", "securitybaseapi", "aclapi", "wincontypes", "wincon", "synchapi", "ioapiset", "jobapi2"] }
 winhandle = "0.3.0"
 widestring = "0.4.3"

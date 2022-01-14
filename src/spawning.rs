@@ -1,7 +1,11 @@
+use std::os::windows::process::ExitStatusExt;
+use std::process::ExitStatus;
 use std::{convert::TryInto, ffi::OsStr, io, mem, path::Path, ptr};
 use std::{os::windows::prelude::*, path::PathBuf};
 
+use tracing::{debug_span, info, info_span};
 use widestring::U16CString;
+use winapi::um::processthreadsapi::GetExitCodeProcess;
 use winapi::{
     shared::{
         basetsd::SIZE_T,
@@ -53,6 +57,8 @@ impl Process {
         working_directory: &Path,
         environment: impl Iterator<Item = (&'a OsStr, &'a OsStr)>,
     ) -> io::Result<Process> {
+        let span = info_span!("Process::spawn");
+        let _guard = span.enter();
         unsafe {
             let command_line = U16CString::from_str(command_line).unwrap();
             let working_directory = U16CString::from_os_str(working_directory).unwrap();
@@ -123,10 +129,21 @@ impl Process {
     }
 
     pub fn wait(&mut self) -> io::Result<()> {
+        let span = debug_span!("Process::wait");
+        let _guard = span.enter();
         unsafe {
             if WaitForSingleObject(self.process_info.hProcess, INFINITE) != WAIT_OBJECT_0 {
                 return Err(io::Error::last_os_error());
             }
+            let mut exit_code_raw: DWORD = 0;
+            if GetExitCodeProcess(self.process_info.hProcess, &mut exit_code_raw) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let exit_code = ExitStatus::from_raw(exit_code_raw);
+            info!(
+                exit_code = exit_code_raw,
+                "process exited with code {}", exit_code
+            );
             Ok(())
         }
     }

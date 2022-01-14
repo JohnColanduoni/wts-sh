@@ -5,7 +5,7 @@ use winapi::{
     um::{
         consoleapi::{
             ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, ReadConsoleInputW,
-            SetConsoleMode,
+            ResizePseudoConsole, SetConsoleMode,
         },
         processenv::GetStdHandle,
         winbase::{STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
@@ -26,6 +26,9 @@ use winhandle::{macros::SUCCEEDED, WinHandleRef};
 pub struct Pty {
     pcon: HPCON,
 }
+
+unsafe impl Send for Pty {}
+unsafe impl Sync for Pty {}
 
 impl Drop for Pty {
     fn drop(&mut self) {
@@ -54,6 +57,22 @@ impl Pty {
 
     pub fn pcon(&self) -> HPCON {
         self.pcon
+    }
+
+    pub fn resize(&self, width: u32, height: u32) -> io::Result<()> {
+        unsafe {
+            let result = ResizePseudoConsole(
+                self.pcon,
+                COORD {
+                    X: width.try_into().unwrap(),
+                    Y: height.try_into().unwrap(),
+                },
+            );
+            if !SUCCEEDED(result) {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
     }
 }
 

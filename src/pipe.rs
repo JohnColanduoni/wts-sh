@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use tracing::{debug, trace_span};
 use widestring::U16CString;
 use winapi::{
     shared::{
@@ -23,7 +24,7 @@ use winapi::{
         fileapi::{CreateFileW, FlushFileBuffers, ReadFile, WriteFile, OPEN_EXISTING},
         ioapiset::GetOverlappedResultEx,
         minwinbase::{OVERLAPPED, SECURITY_ATTRIBUTES},
-        namedpipeapi::{ConnectNamedPipe, CreateNamedPipeW, SetNamedPipeHandleState},
+        namedpipeapi::{ConnectNamedPipe, CreateNamedPipeW, CreatePipe, SetNamedPipeHandleState},
         processthreadsapi::{GetCurrentProcess, OpenProcessToken},
         securitybaseapi::{
             GetTokenInformation, InitializeSecurityDescriptor, SetSecurityDescriptorDacl,
@@ -54,6 +55,10 @@ pub struct Pipe {
 }
 
 pub struct _Pipe {
+    pipe: WinHandle,
+}
+
+pub struct AnonPipe {
     pipe: WinHandle,
 }
 
@@ -195,8 +200,33 @@ impl Pipe {
     }
 }
 
+impl AnonPipe {
+    pub fn pair() -> io::Result<(AnonPipe, AnonPipe)> {
+        unsafe {
+            let mut pipe_read = ptr::null_mut();
+            let mut pipe_write = ptr::null_mut();
+            if CreatePipe(&mut pipe_read, &mut pipe_write, ptr::null_mut(), 0) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let pipe_read = AnonPipe {
+                pipe: WinHandle::from_raw_unchecked(pipe_read),
+            };
+            let pipe_write = AnonPipe {
+                pipe: WinHandle::from_raw_unchecked(pipe_write),
+            };
+            Ok((pipe_write, pipe_read))
+        }
+    }
+
+    pub fn handle(&self) -> &WinHandleRef {
+        &self.pipe
+    }
+}
+
 impl Read for Pipe {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let span = trace_span!("Pipe::read", bytes_read = tracing::field::Empty);
+        let _guard = span.enter();
         unsafe {
             let mut bytes_read: DWORD = 0;
             let mut overlapped: Box<OVERLAPPED> = Box::new(mem::zeroed());
@@ -206,7 +236,7 @@ impl Read for Pipe {
                 buf.as_mut_ptr() as _,
                 buf.len().try_into().expect("buffer too large"),
                 &mut bytes_read,
-                ptr::null_mut(),
+                &mut *overlapped,
             ) != TRUE
             {
                 let mut last_error = GetLastError();
@@ -232,6 +262,7 @@ impl Read for Pipe {
                     return Err(io::Error::last_os_error());
                 }
             }
+            span.record("bytes_read", &bytes_read);
             Ok(bytes_read as usize)
         }
     }
@@ -279,6 +310,61 @@ impl Write for Pipe {
         }
     }
 }
+
+impl Read for AnonPipe {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        unsafe {
+            let mut bytes_read: DWORD = 0;
+            if ReadFile(
+                self.pipe.get(),
+                buf.as_mut_ptr() as _,
+                buf.len().try_into().expect("buffer too large"),
+                &mut bytes_read,
+                ptr::null_mut(),
+            ) != TRUE
+            {
+                let last_error = GetLastError();
+
+                if last_error == ERROR_BROKEN_PIPE {
+                    // This is a normal EOF condition
+                    return Ok(0);
+                } else {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(bytes_read as usize)
+        }
+    }
+}
+
+impl Write for AnonPipe {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        unsafe {
+            let mut bytes_written: DWORD = 0;
+            if WriteFile(
+                self.pipe.get(),
+                buf.as_ptr() as _,
+                buf.len().try_into().expect("buffer too large"),
+                &mut bytes_written,
+                ptr::null_mut(),
+            ) != TRUE
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(bytes_written as usize)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        unsafe {
+            if FlushFileBuffers(self.pipe.get()) != TRUE {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
+}
+
 fn create_event() -> io::Result<WinHandle> {
     unsafe {
         let handle = CreateEventW(ptr::null_mut(), TRUE, FALSE, ptr::null());

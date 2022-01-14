@@ -1,3 +1,5 @@
+#![feature(maybe_uninit_slice, maybe_uninit_uninit_array)]
+
 mod console;
 mod pipe;
 mod spawning;
@@ -7,15 +9,17 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     io::{self, stdin, stdout, BufRead, BufReader, Read, Write},
+    mem::{self, MaybeUninit},
     path::PathBuf,
 };
 
+use console::{read_events, InputRecord};
 use serde::{Deserialize, Serialize};
 use winapi::{
     shared::minwindef::{DWORD, TRUE},
     um::{
         processthreadsapi::{GetCurrentProcessId, ProcessIdToSessionId},
-        wincontypes::COORD,
+        wincontypes::{COORD, INPUT_RECORD},
     },
 };
 
@@ -114,15 +118,60 @@ fn client() -> io::Result<i32> {
     let _write_thread = std::thread::spawn({
         let mut pipe = pipe.copy()?;
         move || -> io::Result<()> {
-            let mut stdin = stdin();
+            let mut buffer: [MaybeUninit<INPUT_RECORD>; 1024] = MaybeUninit::uninit_array();
+            let mut output_code_units: Vec<u16> = Vec::new();
+            let mut output_bytes = Vec::new();
             loop {
-                let mut buffer = [0u8; 4096];
-                let bytes_read = stdin.read(&mut buffer)?;
-                if bytes_read == 0 {
-                    return Ok(());
+                for event in read_events(&mut buffer)? {
+                    match event {
+                        InputRecord::Key(key) => {
+                            let uchar = unsafe { *key.uChar.UnicodeChar() };
+                            if key.bKeyDown != 0 {
+                                output_code_units.push(uchar);
+                            }
+                        }
+                        InputRecord::Mouse(_) => todo!(),
+                        InputRecord::WindowBufferSize(_) => todo!(),
+                        InputRecord::Menu(_) => todo!(),
+                        InputRecord::Focus(_) => todo!(),
+                    }
                 }
-                pipe.write_all(&buffer[..bytes_read])?;
-                pipe.flush()?;
+
+                if &*output_code_units == &[0x1B] {
+                    // ConPTY doesn't handle isolated ESC bytes correctly
+                    // TODO: fix this for e.g. VI
+                    output_code_units.clear();
+                    continue;
+                }
+
+                let mut chars = char::decode_utf16(output_code_units.iter().cloned());
+                output_bytes.clear();
+                loop {
+                    match chars.next() {
+                        Some(Ok(c)) => {
+                            let mut utf8_buf = [0u8; 4];
+                            output_bytes.extend_from_slice(c.encode_utf8(&mut utf8_buf).as_bytes());
+                        }
+                        Some(Err(_)) => {
+                            if chars.next().is_some() {
+                                panic!("bad UTF-16");
+                            } else {
+                                // Leftover partial surrogate, leave in array
+                                output_code_units.drain(..(output_code_units.len() - 1));
+                                break;
+                            }
+                        }
+                        None => {
+                            // All code units processed
+                            output_code_units.clear();
+                            break;
+                        }
+                    }
+                }
+
+                if !output_bytes.is_empty() {
+                    pipe.write_all(&output_bytes)?;
+                }
             }
         }
     });

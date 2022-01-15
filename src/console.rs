@@ -1,14 +1,16 @@
 use std::{convert::TryInto, io, mem::MaybeUninit, ptr};
 
+use tracing::debug_span;
 use winapi::{
     shared::minwindef::{DWORD, TRUE},
     um::{
         consoleapi::{
-            ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, ReadConsoleInputW,
-            ResizePseudoConsole, SetConsoleMode,
+            ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, GetNumberOfConsoleInputEvents,
+            ReadConsoleInputW, ResizePseudoConsole, SetConsoleMode,
         },
         processenv::GetStdHandle,
-        winbase::{STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
+        synchapi::WaitForMultipleObjects,
+        winbase::{INFINITE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, WAIT_FAILED, WAIT_OBJECT_0},
         wincon::{
             GetConsoleScreenBufferInfo, CONSOLE_SCREEN_BUFFER_INFO, DISABLE_NEWLINE_AUTO_RETURN,
             ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
@@ -22,6 +24,8 @@ use winapi::{
     },
 };
 use winhandle::{macros::SUCCEEDED, WinHandleRef};
+
+use crate::synch::Interrupt;
 
 pub struct Pty {
     pcon: HPCON,
@@ -93,24 +97,24 @@ pub fn enable_virtual_console() -> io::Result<()> {
     unsafe {
         let mut console_mode: DWORD = 0;
         GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mut console_mode);
-        let hresult = SetConsoleMode(
+        if SetConsoleMode(
             GetStdHandle(STD_OUTPUT_HANDLE),
             console_mode
                 | ENABLE_PROCESSED_OUTPUT
                 | DISABLE_NEWLINE_AUTO_RETURN
                 | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-        );
-        if !SUCCEEDED(hresult) {
+        ) == 0
+        {
             return Err(io::Error::last_os_error());
         }
         GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mut console_mode);
-        let hresult = SetConsoleMode(
+        if SetConsoleMode(
             GetStdHandle(STD_INPUT_HANDLE),
             console_mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)
                 | ENABLE_WINDOW_INPUT
                 | ENABLE_VIRTUAL_TERMINAL_INPUT,
-        );
-        if !SUCCEEDED(hresult) {
+        ) == 0
+        {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -127,6 +131,46 @@ pub enum InputRecord<'a> {
 
 pub struct RecordIter<'a> {
     raw: std::slice::Iter<'a, INPUT_RECORD>,
+}
+
+pub fn wait_for_input_events_or_interrupt(event: &Interrupt) -> io::Result<Option<usize>> {
+    const WAIT_OBJECT_1: u32 = WAIT_OBJECT_0 + 1;
+
+    let span = debug_span!("wait_for_input_events_or_interrupt");
+    let _guard = span.enter();
+
+    unsafe {
+        let input = GetStdHandle(STD_INPUT_HANDLE);
+        let mut handles = [input, event.event().get()];
+        loop {
+            match WaitForMultipleObjects(
+                handles.len().try_into().unwrap(),
+                handles.as_mut_ptr(),
+                0,
+                INFINITE,
+            ) {
+                WAIT_OBJECT_0 => {
+                    let mut event_count = 0;
+                    if GetNumberOfConsoleInputEvents(input, &mut event_count) == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    return Ok(Some(event_count as usize));
+                }
+                WAIT_OBJECT_1 => {
+                    return Ok(None);
+                }
+                WAIT_FAILED => {
+                    return Err(io::Error::last_os_error());
+                }
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("invalid return value {other} from WaitForMultipleObjects"),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 pub fn read_events(buffer: &mut [MaybeUninit<INPUT_RECORD>]) -> io::Result<RecordIter> {

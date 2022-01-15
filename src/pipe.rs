@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use tracing::{debug, trace_span};
+use tracing::{debug, debug_span, info_span, trace_span};
 use widestring::U16CString;
 use winapi::{
     shared::{
@@ -29,10 +29,10 @@ use winapi::{
         securitybaseapi::{
             GetTokenInformation, InitializeSecurityDescriptor, SetSecurityDescriptorDacl,
         },
-        synchapi::CreateEventW,
+        synchapi::{CreateEventW, WaitForMultipleObjects},
         winbase::{
-            LocalFree, FILE_FLAG_OVERLAPPED, INFINITE, PIPE_ACCESS_DUPLEX, PIPE_READMODE_BYTE,
-            PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+            LocalFree, FILE_FLAG_OVERLAPPED, INFINITE, PIPE_ACCESS_DUPLEX, PIPE_READMODE_MESSAGE,
+            PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WAIT_FAILED, WAIT_OBJECT_0,
         },
         winnt::{
             TokenUser, GENERIC_READ, GENERIC_WRITE, KEY_ALL_ACCESS, SECURITY_DESCRIPTOR_MIN_LENGTH,
@@ -44,6 +44,8 @@ use winhandle::{
     macros::{GetLastError, INVALID_HANDLE_VALUE},
     WinHandle, WinHandleRef, WinHandleTarget,
 };
+
+use crate::synch::Interrupt;
 
 pub struct ServerPipe {
     pipe: WinHandle,
@@ -110,7 +112,7 @@ impl ServerPipe {
             let handle = CreateNamedPipeW(
                 pipe_name.as_ptr(),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 0,
                 0,
@@ -134,7 +136,7 @@ impl ServerPipe {
                 return Err(io::Error::last_os_error());
             }
 
-            let mut mode = PIPE_READMODE_BYTE;
+            let mut mode = PIPE_READMODE_MESSAGE;
             if SetNamedPipeHandleState(self.pipe.get(), &mut mode, ptr::null_mut(), ptr::null_mut())
                 != TRUE
             {
@@ -179,7 +181,7 @@ impl Pipe {
             }
             let pipe = WinHandle::from_raw_unchecked(handle);
 
-            let mut mode = PIPE_READMODE_BYTE;
+            let mut mode = PIPE_READMODE_MESSAGE;
             if SetNamedPipeHandleState(pipe.get(), &mut mode, ptr::null_mut(), ptr::null_mut())
                 != TRUE
             {
@@ -195,49 +197,21 @@ impl Pipe {
         }
     }
 
-    pub fn handle(&self) -> &WinHandleRef {
-        &self.shared.pipe
-    }
-}
-
-impl AnonPipe {
-    pub fn pair() -> io::Result<(AnonPipe, AnonPipe)> {
-        unsafe {
-            let mut pipe_read = ptr::null_mut();
-            let mut pipe_write = ptr::null_mut();
-            if CreatePipe(&mut pipe_read, &mut pipe_write, ptr::null_mut(), 0) == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let pipe_read = AnonPipe {
-                pipe: WinHandle::from_raw_unchecked(pipe_read),
-            };
-            let pipe_write = AnonPipe {
-                pipe: WinHandle::from_raw_unchecked(pipe_write),
-            };
-            Ok((pipe_write, pipe_read))
-        }
-    }
-
-    pub fn handle(&self) -> &WinHandleRef {
-        &self.pipe
-    }
-}
-
-impl Read for Pipe {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let span = trace_span!("Pipe::read", bytes_read = tracing::field::Empty);
+    pub fn recv(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let span = debug_span!("Pipe::recv", bytes_read = tracing::field::Empty);
         let _guard = span.enter();
+
         unsafe {
             let mut bytes_read: DWORD = 0;
             let mut overlapped: Box<OVERLAPPED> = Box::new(mem::zeroed());
             overlapped.hEvent = self.event.get();
             if ReadFile(
                 self.shared.pipe.get(),
-                buf.as_mut_ptr() as _,
-                buf.len().try_into().expect("buffer too large"),
+                buffer.as_mut_ptr() as _,
+                buffer.len().try_into().expect("buffer too large"),
                 &mut bytes_read,
                 &mut *overlapped,
-            ) != TRUE
+            ) == FALSE
             {
                 let mut last_error = GetLastError();
                 if last_error == ERROR_IO_PENDING {
@@ -249,6 +223,7 @@ impl Read for Pipe {
                         FALSE,
                     ) == TRUE
                     {
+                        span.record("bytes_read", &bytes_read);
                         return Ok(bytes_read as usize);
                     } else {
                         last_error = GetLastError();
@@ -266,10 +241,85 @@ impl Read for Pipe {
             Ok(bytes_read as usize)
         }
     }
-}
 
-impl Write for Pipe {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    pub fn recv_or_interrupt(
+        &mut self,
+        buffer: &mut [u8],
+        interrupt: &Interrupt,
+    ) -> io::Result<Option<usize>> {
+        const WAIT_OBJECT_1: u32 = WAIT_OBJECT_0 + 1;
+
+        let span = debug_span!(
+            "Pipe::recv_or_interrupt",
+            bytes_read = tracing::field::Empty
+        );
+        let _guard = span.enter();
+
+        unsafe {
+            let mut bytes_read: DWORD = 0;
+            let mut overlapped: Box<OVERLAPPED> = Box::new(mem::zeroed());
+            overlapped.hEvent = self.event.get();
+            if ReadFile(
+                self.shared.pipe.get(),
+                buffer.as_mut_ptr() as _,
+                buffer.len().try_into().expect("buffer too large"),
+                &mut bytes_read,
+                &mut *overlapped,
+            ) == FALSE
+            {
+                let mut last_error = GetLastError();
+                if last_error == ERROR_IO_PENDING {
+                    let mut handles = [self.event.get(), interrupt.event().get()];
+                    match WaitForMultipleObjects(
+                        handles.len().try_into().unwrap(),
+                        handles.as_mut_ptr(),
+                        0,
+                        INFINITE,
+                    ) {
+                        WAIT_OBJECT_0 => {}
+                        WAIT_OBJECT_1 => {
+                            // Interrupted
+                            return Ok(None);
+                        }
+                        WAIT_FAILED => {
+                            return Err(io::Error::last_os_error());
+                        }
+                        other => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("invalid return value {other} from WaitForMultipleObjects"),
+                            ));
+                        }
+                    }
+
+                    if GetOverlappedResultEx(
+                        self.shared.pipe.get(),
+                        &mut *overlapped,
+                        &mut bytes_read,
+                        0,
+                        FALSE,
+                    ) == TRUE
+                    {
+                        span.record("bytes_read", &bytes_read);
+                        return Ok(Some(bytes_read as usize));
+                    } else {
+                        last_error = GetLastError();
+                    }
+                }
+
+                if last_error == ERROR_BROKEN_PIPE {
+                    // This is a normal EOF condition
+                    return Ok(Some(0));
+                } else {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            span.record("bytes_read", &bytes_read);
+            Ok(Some(bytes_read as usize))
+        }
+    }
+
+    pub fn send(&mut self, buf: &[u8]) -> io::Result<usize> {
         unsafe {
             let mut bytes_written: DWORD = 0;
             let mut overlapped: Box<OVERLAPPED> = Box::new(mem::zeroed());
@@ -300,14 +350,28 @@ impl Write for Pipe {
             Ok(bytes_written as usize)
         }
     }
+}
 
-    fn flush(&mut self) -> io::Result<()> {
+impl AnonPipe {
+    pub fn pair() -> io::Result<(AnonPipe, AnonPipe)> {
         unsafe {
-            if FlushFileBuffers(self.shared.pipe.get()) != TRUE {
+            let mut pipe_read = ptr::null_mut();
+            let mut pipe_write = ptr::null_mut();
+            if CreatePipe(&mut pipe_read, &mut pipe_write, ptr::null_mut(), 0) == 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(())
+            let pipe_read = AnonPipe {
+                pipe: WinHandle::from_raw_unchecked(pipe_read),
+            };
+            let pipe_write = AnonPipe {
+                pipe: WinHandle::from_raw_unchecked(pipe_write),
+            };
+            Ok((pipe_write, pipe_read))
         }
+    }
+
+    pub fn handle(&self) -> &WinHandleRef {
+        &self.pipe
     }
 }
 

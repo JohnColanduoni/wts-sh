@@ -128,7 +128,7 @@ impl Process {
         }
     }
 
-    pub fn wait(&mut self) -> io::Result<()> {
+    pub fn wait(&mut self) -> io::Result<DWORD> {
         let span = debug_span!("Process::wait");
         let _guard = span.enter();
         unsafe {
@@ -144,7 +144,7 @@ impl Process {
                 exit_code = exit_code_raw,
                 "process exited with code {}", exit_code
             );
-            Ok(())
+            Ok(exit_code_raw)
         }
     }
 }

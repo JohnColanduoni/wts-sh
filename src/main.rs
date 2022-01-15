@@ -1,8 +1,10 @@
 #![feature(maybe_uninit_slice, maybe_uninit_uninit_array)]
+#![feature(box_patterns)]
 
 mod console;
 mod pipe;
 mod spawning;
+mod synch;
 
 use std::{
     borrow::Cow,
@@ -10,15 +12,16 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
-    io::{self, stdin, stdout, BufRead, BufReader, Read, Write},
-    mem::{self, MaybeUninit},
+    io::{self, stdout, BufRead, BufReader, BufWriter, Read, Write},
+    mem::MaybeUninit,
     path::PathBuf,
     sync::Arc,
 };
 
 use clap::Parser;
-use console::{read_events, InputRecord};
-use serde::{de::VariantAccess, Deserialize, Serialize, __private::ser};
+use console::{read_events, wait_for_input_events_or_interrupt, InputRecord};
+use serde::{Deserialize, Serialize};
+use synch::Interrupt;
 use tracing::{debug, debug_span, info, info_span, trace, trace_span};
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 use winapi::{
@@ -42,6 +45,9 @@ struct Options {
     server: bool,
 
     #[clap(long)]
+    socket_name: Option<String>,
+
+    #[clap(long)]
     log_file: Option<PathBuf>,
 }
 
@@ -54,7 +60,7 @@ fn main() {
             std::process::exit(2);
         }
 
-        match server() {
+        match server(&options) {
             Ok(ret) => {
                 std::process::exit(ret);
             }
@@ -120,9 +126,15 @@ struct CommandSpec {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-enum ShellEvent<'a> {
+enum InputEvent<'a> {
     KeySequence { bytes: Cow<'a, [u8]> },
     Resize { width: u32, height: u32 },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+enum OutputEvent<'a> {
+    Output { bytes: Cow<'a, [u8]> },
+    Exit { code: DWORD },
 }
 
 fn client(options: &Options, command: &[OsString]) -> io::Result<i32> {
@@ -164,7 +176,8 @@ fn client(options: &Options, command: &[OsString]) -> io::Result<i32> {
         environment: std::env::vars_os().collect(),
     };
 
-    let mut pipe = if let Some(pipe) = Pipe::connect(&pipe_name(1))? {
+    let mut pipe = if let Some(pipe) = Pipe::connect(&pipe_name(1, options.socket_name.as_deref()))?
+    {
         pipe
     } else {
         eprintln!("a wts-sh server does not appear to be running");
@@ -173,33 +186,50 @@ fn client(options: &Options, command: &[OsString]) -> io::Result<i32> {
 
     let mut command_json = serde_json::to_string(&command).unwrap();
     command_json.push('\n');
-    pipe.write(command_json.as_bytes())?;
+    pipe.send(command_json.as_bytes())?;
 
     enable_virtual_console()?;
 
-    let read_thread = std::thread::spawn({
+    let output_thread = std::thread::spawn({
         let mut pipe = pipe.copy()?;
-        move || -> io::Result<()> {
+        move || -> io::Result<DWORD> {
             let mut stdout = stdout();
+            let mut buffer = [0u8; MAX_MESSAGE_SIZE];
             loop {
-                let mut buffer = [0u8; 4096];
-                let bytes_read = pipe.read(&mut buffer)?;
-                if bytes_read == 0 {
-                    return Ok(());
+                let message_bytes_read = pipe.recv(&mut buffer)?;
+                if message_bytes_read == 0 {
+                    // server shutdown unexpectedly, just exit with error code
+                    return Ok(123);
                 }
-                stdout.write_all(&buffer[..bytes_read])?;
-                stdout.flush()?;
+                let event: OutputEvent =
+                    bincode::deserialize(&buffer[..message_bytes_read]).unwrap();
+                match event {
+                    OutputEvent::Output { bytes } => {
+                        stdout.write_all(&bytes)?;
+                        stdout.flush()?;
+                    }
+                    OutputEvent::Exit { code } => return Ok(code),
+                }
             }
         }
     });
 
-    let _write_thread = std::thread::spawn({
+    let input_interrupt = Arc::new(Interrupt::new()?);
+    let input_thread = std::thread::spawn({
         let mut pipe = pipe.copy()?;
+        let write_interrupt = input_interrupt.clone();
         move || -> io::Result<()> {
             let mut buffer: [MaybeUninit<INPUT_RECORD>; 1024] = MaybeUninit::uninit_array();
             let mut output_code_units: Vec<u16> = Vec::new();
             let mut output_bytes = Vec::new();
+            let mut message_buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
             loop {
+                match wait_for_input_events_or_interrupt(&write_interrupt)? {
+                    Some(0) => continue,
+                    None => return Ok(()),
+                    Some(_) => {}
+                }
+
                 {
                     let span = trace_span!("read_events");
                     let _guard = span.enter();
@@ -223,9 +253,11 @@ fn client(options: &Options, command: &[OsString]) -> io::Result<i32> {
                                 let (width, height) = get_console_size()?;
 
                                 debug!(width, height, "window resize event");
-                                let event = ShellEvent::Resize { width, height };
-                                // TODO: buffer
-                                bincode::serialize_into(&mut pipe, &event).unwrap();
+                                send_bincode(
+                                    &mut pipe,
+                                    &mut message_buffer,
+                                    &InputEvent::Resize { width, height },
+                                )?;
                             }
                             InputRecord::Menu(_) => todo!(),
                             InputRecord::Focus(_) => todo!(),
@@ -266,23 +298,29 @@ fn client(options: &Options, command: &[OsString]) -> io::Result<i32> {
                 }
 
                 if !output_bytes.is_empty() {
-                    let event = ShellEvent::KeySequence {
-                        bytes: Cow::Borrowed(&output_bytes),
-                    };
-                    // TODO: buffer
-                    bincode::serialize_into(&mut pipe, &event).unwrap();
+                    send_bincode(
+                        &mut pipe,
+                        &mut message_buffer,
+                        &InputEvent::KeySequence {
+                            bytes: Cow::Borrowed(&output_bytes),
+                        },
+                    )?;
                 }
             }
         }
     });
 
-    read_thread.join().unwrap()?;
-    // We don't join the write thread since its blocked on stdin
+    // Read thread will exit once connection is closed
+    let code = output_thread.join().unwrap()?;
 
-    Ok(0)
+    // Interrupt write thread and wait for it to terminate
+    input_interrupt.interrupt()?;
+    input_thread.join().unwrap()?;
+
+    Ok(code as i32)
 }
 
-fn server() -> io::Result<i32> {
+fn server(options: &Options) -> io::Result<i32> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
@@ -298,7 +336,7 @@ fn server() -> io::Result<i32> {
     }
 
     loop {
-        let server_pipe = ServerPipe::new(&pipe_name(session_id))?;
+        let server_pipe = ServerPipe::new(&pipe_name(session_id, options.socket_name.as_deref()))?;
 
         let pipe = server_pipe.accept()?;
 
@@ -310,23 +348,24 @@ fn server() -> io::Result<i32> {
     }
 }
 
-fn server_thread(pipe: Pipe) -> io::Result<()> {
+const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+
+fn server_thread(mut pipe: Pipe) -> io::Result<()> {
     let span = info_span!("run_command", command_line = tracing::field::Empty);
     let _guard = span.enter();
 
-    let mut reader = BufReader::new(pipe.copy()?);
-
-    let mut command_json = String::new();
-    reader.read_line(&mut command_json)?;
-    reader.into_inner();
-
-    let command: CommandSpec =
-        serde_json::from_str(&command_json).expect("failed to deserialize command");
+    let command: CommandSpec = {
+        let mut command_json_buffer = vec![0u8; MAX_MESSAGE_SIZE];
+        let bytes_read = pipe.recv(&mut command_json_buffer)?;
+        command_json_buffer.truncate(bytes_read);
+        serde_json::from_slice(&command_json_buffer).expect("failed to deserialize command")
+    };
 
     debug!(?command, "parsed command");
     span.record("command_line", &&*command.command_line);
 
     let (mut pty_input_tx, pty_input_rx) = AnonPipe::pair()?;
+    let (pty_output_tx, mut pty_output_rx) = AnonPipe::pair()?;
 
     let pty = Arc::new(Pty::new(
         COORD {
@@ -340,31 +379,67 @@ fn server_thread(pipe: Pipe) -> io::Result<()> {
                 .expect("console height too large"),
         },
         pty_input_rx.handle(),
-        pipe.handle(),
+        pty_output_tx.handle(),
         0,
     )?);
 
-    let _read_thread = std::thread::spawn({
-        let pipe = pipe.copy()?;
+    let exit_interrupt = Arc::new(Interrupt::new()?);
+
+    let input_thread = std::thread::spawn({
+        let mut pipe = pipe.copy()?;
         let pty = pty.clone();
+        let exit_interrupt = exit_interrupt.clone();
         move || -> io::Result<()> {
-            let span = debug_span!("server_thread::read_thread");
+            let span = debug_span!("server_thread::input_thread");
             let _guard = span.enter();
 
-            let mut event_reader = BufReader::new(pipe);
+            let mut buffer = [0u8; MAX_MESSAGE_SIZE];
 
             loop {
-                let event: ShellEvent = bincode::deserialize_from(&mut event_reader).unwrap();
+                let event_bytes = match pipe.recv_or_interrupt(&mut buffer, &exit_interrupt)? {
+                    Some(0) => return Ok(()),
+                    Some(bytes_read) => &buffer[..bytes_read],
+                    None => return Ok(()),
+                };
+
+                let event: InputEvent = bincode::deserialize(event_bytes).unwrap();
+
+                trace!(?event, "input event");
 
                 match event {
-                    ShellEvent::KeySequence { bytes } => {
+                    InputEvent::KeySequence { bytes } => {
                         pty_input_tx.write_all(&bytes)?;
                         pty_input_tx.flush()?;
                     }
-                    ShellEvent::Resize { width, height } => {
+                    InputEvent::Resize { width, height } => {
                         pty.resize(width, height)?;
                     }
                 }
+            }
+        }
+    });
+
+    let output_thread = std::thread::spawn({
+        let mut pipe = pipe.copy()?;
+        move || -> io::Result<()> {
+            let span = debug_span!("server_thread::output_thread");
+            let _guard = span.enter();
+
+            let mut read_buffer = [0u8; 4096];
+            let mut message_buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
+            loop {
+                let read_count = pty_output_rx.read(&mut read_buffer)?;
+                if read_count == 0 {
+                    return Ok(());
+                }
+
+                send_bincode(
+                    &mut pipe,
+                    &mut message_buffer,
+                    &OutputEvent::Output {
+                        bytes: Cow::Borrowed(&read_buffer[..read_count]),
+                    },
+                )?;
             }
         }
     });
@@ -378,16 +453,35 @@ fn server_thread(pipe: Pipe) -> io::Result<()> {
         command.environment.iter().map(|(k, v)| (&**k, &**v)),
     )?;
 
-    process.wait()?;
+    let exit_code = process.wait()?;
+
+    exit_interrupt.interrupt()?;
+    // Drop console and pipe in output thread get EOF
+    std::mem::drop(pty);
+    std::mem::drop(pty_input_rx);
+    std::mem::drop(pty_output_tx);
+
+    input_thread.join().unwrap()?;
+    output_thread.join().unwrap()?;
+
+    let exit_message = bincode::serialize(&OutputEvent::Exit { code: exit_code }).unwrap();
+    pipe.send(&exit_message)?;
 
     info!("finished servicing client");
 
     Ok(())
 }
 
-fn pipe_name(session_id: DWORD) -> String {
+fn pipe_name(session_id: DWORD, socket_name: Option<&str>) -> String {
     // Ensure we use pipe in the global namespace, as we want access from different sessions to be possible
-    format!(r#"\??\GLOBAL\pipe\Global\WtsSh.{}"#, session_id)
+    if let Some(socket_name) = socket_name {
+        format!(
+            r#"\??\GLOBAL\pipe\Global\WtsSh.{}.{}"#,
+            session_id, socket_name
+        )
+    } else {
+        format!(r#"\??\GLOBAL\pipe\Global\WtsSh.{}"#, session_id)
+    }
 }
 
 fn get_current_session() -> io::Result<DWORD> {
@@ -398,4 +492,17 @@ fn get_current_session() -> io::Result<DWORD> {
         }
         Ok(session_id)
     }
+}
+
+fn send_bincode<T>(pipe: &mut Pipe, buffer: &mut Vec<u8>, message: &T) -> io::Result<()>
+where
+    T: Serialize,
+{
+    buffer.clear();
+    {
+        let mut message_writer = io::Cursor::new(&mut *buffer);
+        bincode::serialize_into(&mut message_writer, message).unwrap();
+    }
+    pipe.send(buffer)?;
+    Ok(())
 }

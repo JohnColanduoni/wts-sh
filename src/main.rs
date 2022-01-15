@@ -480,7 +480,7 @@ fn pipe_name(session_id: DWORD, socket_name: Option<&str>) -> String {
             session_id, socket_name
         )
     } else {
-        format!(r#"\??\GLOBAL\pipe\Global\WtsSh.{}"#, session_id)
+        format!(r#"\??\GLOBAL\pipe\Global\WtsSh.{}.default"#, session_id)
     }
 }
 

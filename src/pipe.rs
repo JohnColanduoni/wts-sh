@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use tracing::{debug, debug_span, info_span, trace_span};
+use tracing::debug_span;
 use widestring::U16CString;
 use winapi::{
     shared::{

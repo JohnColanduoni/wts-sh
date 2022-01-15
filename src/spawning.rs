@@ -1,7 +1,7 @@
+use std::os::windows::prelude::*;
 use std::os::windows::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::{convert::TryInto, ffi::OsStr, io, mem, path::Path, ptr};
-use std::{os::windows::prelude::*, path::PathBuf};
 
 use tracing::{debug_span, info, info_span};
 use widestring::U16CString;

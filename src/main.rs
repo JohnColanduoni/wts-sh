@@ -12,7 +12,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
-    io::{self, stdout, BufRead, BufReader, BufWriter, Read, Write},
+    io::{self, stdout, Read, Write},
     mem::MaybeUninit,
     path::PathBuf,
     sync::Arc,
